@@ -1,0 +1,1373 @@
+#!/usr/bin/perl -w
+#
+# AS AT 27Mar2011
+#
+# inverter_phoenixtec.pl - polls data from the RS232 port on inverters and outputs to csv file.
+# Should work with PHOENIXTEC manufactured inverters: CMS / Sun Ezy / Orion / Eaton et al.
+# Uploads data to http://pvoutput.org IF 'USE_PVOUTPUT' is set to 1 .
+# NOTE: PVoutput can take 60 / hour but will only keep 1 / 5-10mins depending on your setting.
+#
+# Usage examples:
+#       perl inverter_phoenixtec.pl
+#       perl inverter_phoenixtec.pl "COM1"
+#       perl inverter_phoenixtec.pl "/dev/ttyS0"
+#
+# Arguments:
+#  $ARGV[0] = OPTIONAL port name (eg: "COM1") if have >1 inverter. See: SERIAL_PORT_WIN & SERIAL_PORT_OTH for defaults.
+#
+# (c) 2010-2011 jinba @ jinba-ittai.net
+# Licensed under the GNU GPL version 2
+#
+# + editions by shell_l_d:
+#          + edited to work with ActivePerl (Windows) too
+#          + added version/firmware checking & combined CMS2k & CMS10k (parseData) versions
+#          + added data format checking (per findings from JinbaIttai & Ingmar)
+#          + added constants, %HoH, %HASH
+#          + added writeToPort() & added warnings to readbuf()
+#          + edited calc of sleep so dont have to keep DATAPOLL_FREQ_SECS set to 60.
+#          + edited pvoutput code so dont have to keep DATAPOLL_FREQ_SECS set to 60.
+#          + added DESCR to $HoH hash of hashes & used in parseDataFmt()
+#          + added check if ( $seconds > 0 ) before 'sleep $seconds'
+#          + added DESCR to parseData() & replaced die with warning in writeToFile()
+#          + added REQUEST_PARAMFMT, REQUEST_PARAMS, RESPONSE_PARAMFMT, RESPONSE_PARAMS
+#          + added %HoHparams, closeSerialPort(), parseParamFmt(), parseParam()
+#          + renamed %HoH items: ETOTAL, HTOTAL, UNK1 through UNK9
+#          + edited etotal & htotal calcs in WriteToFile()
+#          + renamed DIVIDEBY to MULTIPLY & edited their values & replaced / with * in parseParam() & parseData()
+#          + added USE_RRDTOOL, RRDTOOL_FILE, RRDFILE_PREFIX_WIN, RRDFILE_PREFIX_OTH, RRDTOOL_EXE_WIN, RRDTOOL_EXE_OTH
+#          + edited REINIT_DEFAULT & writeReadBuffer()
+#
+# + editions by mmcdon23:
+#          + added getDateTime_HHMM() & getDate_YYYYMMDD()
+#          + added date & time strings to writeToFile()
+#	     + added "_YYYYMMDD.csv" to logfile name (suffix)
+#          + edited parseData() by using 0 for ETODAY in morning if hasn't reset yet
+#          + moved sleep from parseData() to main
+#          + moved code from initialise, readbuf & main to writeReadBuffer()
+#            & altered to continue reading until read pattern matched.
+#          + added pvoutput code to main & only send to PVoutput every 5 or 10th min per PVOUTPUT_FREQ constant.
+#          + added calc of sleep seconds to stop the script creeping away from the 00 minute mark.
+#
+# + editions by nigol2:
+#          + added optional port argument in case have more than 1 inverter
+#          + added serial# to logfile name in case have more than 1 inverter
+#
+# + editions by slampt:
+#          + uncommented & edited rrdtool (graphing) code in writeToFile() with help from JinbaIttai
+#
+# Should at least work with:
+# * CMS2000  (CMS 2000)
+# * CMS10000 (CMS 10000) - requires more testing though
+# * SE2800   (SunEzy 2800)
+# * SE4600   (SunEzy 600E)
+# * ETN2000  (Eaton 2000)
+#
+#######################################################################
+
+$| = 1; 	# don't let Perl buffer I/O
+
+
+#######################################################################
+#
+# Define constants & variables
+#
+
+#
+# serial parameters
+#
+use constant {
+    SERIAL_BAUD          => "9600",
+    SERIAL_PORT_WIN      => $ARGV[0] || "COM1",             # COM port 1
+    SERIAL_PORT_OTH      => $ARGV[0] || "/dev/ttyS0",       # Serial port 0
+    # SERIAL_PORT_OTH      => $ARGV[0] || "/dev/ttyUSB0",   # USB port 0
+    # SERIAL_PORT_OTH      => $ARGV[0] || "/dev/rfcomm0",   # Bluetooth port 0
+    SERIAL_PARITY        => "none",
+    SERIAL_DATABITS      => 8,
+    SERIAL_STOPBITS      => 1,
+    SERIAL_HANDSHAKE     => "none",
+    SERIAL_DATATYPE      => 'raw',
+};
+
+#
+# general constants
+#
+use constant {
+    DATAPOLL_FREQ_SECS   => 60,
+    PVOUTPUT_FREQ_SECS   => 5 * 60,   # every 5-10mins per your setting in PVOutput
+#
+    TIMEOUT_DEFAULT      => 2,
+    REINIT_DEFAULT       => 5,          # -1 = infinite num of times (ie dont die)
+#
+    DEBUG_SCRIPT         => 0,   	# 0 = NO, 1 = YES
+    USE_PVOUTPUT         => 1,   	# 0 = NO, 1 = YES	to export data to http://pvoutput.org
+    USE_RRDTOOL          => 1,          # 0 = NO, 1 = YES       to export data to rrdtool for graphing
+#
+    PVOUTPUT_SCRIPT      => "perl pvoutput.pl",
+    # PVOUTPUT_SCRIPT_WIN  => "C:/solar/inverter/pvoutput.pl",
+    # PVOUTPUT_SCRIPT_OTH  => "/home/mark/inverter/pvoutput.pl",
+#
+    LOGFILE_PREFIX_WIN   => "C:/solar/inverter_",  # inverter_[serial#]_YYYYMMDD.csv
+    LOGFILE_PREFIX_OTH   => "/tmp/inverter_",	   # inverter_[serial#]_YYYYMMDD.csv
+#
+    CREATE_RRD_SCRIPT    => "perl create_rrd.pl",
+#
+    RRDFILE_PREFIX_WIN   => "C:/solar/inverter_",  # inverter_[serial#].rrd
+    RRDFILE_PREFIX_OTH   => "/tmp/inverter_",      # inverter_[serial#].rrd
+#
+    RRDTOOL_EXE_WIN      => "C:/rrdtool/rrdtool",
+    RRDTOOL_EXE_OTH      => "/usr/bin/rrdtool",
+};
+
+#
+# hex packet indeces
+#
+use constant {
+    DATA_TO_FOLLOW_INDEX => 8,
+    CAPACITY_INDEX       => 20,
+    CAPACITY_LENGTH      => 12,
+    FIRMWARE_INDEX       => 32,
+    FIRMWARE_LENGTH      => 14,
+    MODEL_INDEX          => 46,
+    MODEL_LENGTH         => 28,
+    MANUF_INDEX          => 74,
+    MANUF_LENGTH         => 32,
+    SERIAL_INDEX         => 106,
+    SERIAL_LENGTH        => 20,
+    OTHER_INDEX          => 138,
+    OTHER_LENGTH         => 8,
+};
+
+#
+# hex packet codes - COMMON
+#
+use constant {
+    PKT_START_SEND        => "aaaa",
+    PKT_START_RECV        => "aaaa",
+    SEND_INIT             => "01000000",		# SOURCE_ADDR + BCAST_ADDR
+    SEND_QRY              => "01000001",		# SOURCE_ADDR + DEST_ADDR
+    RECV_INIT             => "00000100",		# BCAST_ADDR  + SOURCE_ADDR
+    RECV_QRY              => "00010100",		# DEST_ADDR   + SOURCE_ADDR
+};
+
+#
+# hex packet codes - SEND (request to inverter)
+#
+use constant {
+    REQUEST_INITIALISE      => PKT_START_SEND . SEND_INIT . "0004000159",
+    REQUEST_SERIAL          => PKT_START_SEND . SEND_INIT . "0000000155",
+    REQUEST_CONF_SERIAL_1   => PKT_START_SEND . SEND_INIT . "00010b",
+    REQUEST_CONF_SERIAL_2   => "01",
+    REQUEST_VERSION         => PKT_START_SEND . SEND_QRY . "010300015a",
+    REQUEST_PARAMFMT        => PKT_START_SEND . SEND_QRY . "0101000158",
+    REQUEST_PARAM           => PKT_START_SEND . SEND_QRY . "010400015b",
+    REQUEST_DATAFMT         => PKT_START_SEND . SEND_QRY . "0100000157",
+    REQUEST_DATA            => PKT_START_SEND . SEND_QRY . "0102000159",
+};
+
+#
+# hex packet codes - RECV (response from inverter)
+#
+use constant {
+    RESPONSE_SERIAL       => PKT_START_RECV . RECV_INIT . "00800a",
+    RESPONSE_CONF_SERIAL  => PKT_START_RECV . RECV_QRY . "0081",
+    RESPONSE_VERSION      => PKT_START_RECV . RECV_QRY . "0183",
+    RESPONSE_PARAMFMT     => PKT_START_RECV . RECV_QRY . "0181",
+    RESPONSE_PARAM        => PKT_START_RECV . RECV_QRY . "0184",
+    RESPONSE_DATAFMT      => PKT_START_RECV . RECV_QRY . "0180",
+    RESPONSE_DATA         => PKT_START_RECV . RECV_QRY . "0182",
+};
+
+#
+# inverter parameter format codes (hash of hashes)
+#
+%HoHparams = (
+	'VPV-START' => {
+		HEXCODE  => "40",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "PV Start-up voltage",
+	},
+	'T-START'   => {
+		HEXCODE  => "41",
+		MULTIPLY => 1,
+		MEAS     => "Sec",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Time to connect grid",
+	},
+	'VAC-MIN'   => {
+		HEXCODE  => "44",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Minimum operational grid voltage",
+	},
+	'VAC-MAX'   => {
+		HEXCODE  => "45",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Maximum operational grid voltage",
+	},
+	'FAC-MIN'   => {
+		HEXCODE  => "46",
+		MULTIPLY => 0.01,
+		MEAS     => "Hz",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Minimum operational frequency",
+	},
+	'FAC-MAX'   => {
+		HEXCODE  => "47",
+		MULTIPLY => 0.01,
+		MEAS     => "Hz",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Maximum operational frequency",
+	},
+	'ZAC-MAX'   => {
+		HEXCODE  => "48",
+		MULTIPLY => 1,
+		MEAS     => "mOhm",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Maximum operational grid impendance",
+	},
+	'DZAC'      => {
+		HEXCODE  => "49",
+		MULTIPLY => 1,
+		MEAS     => "mOhm",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Allowable Delta Zac of operation",
+	},
+);
+
+#
+# inverter data format codes (hash of hashes)
+#
+%HoH = (
+	TEMP   => {
+		HEXCODE  => "00",
+		MULTIPLY => 0.1,
+		MEAS     => "deg C",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Internal Temperature",
+	},
+	VPV1   => {
+		HEXCODE  => "01",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel 1 Voltage",
+	},
+	VPV2   => {
+		HEXCODE  => "02",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel 2 Voltage",
+	},
+	VPV3   => {
+		HEXCODE  => "03",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel 3 Voltage",
+	},
+	IPV1   => {
+		HEXCODE  => "04",
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel 1 DC Current",
+	},
+	IPV2   => {
+		HEXCODE  => "05",
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel 2 DC Current",
+	},
+	IPV3   => {
+		HEXCODE  => "06",
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel 3 DC Current",
+	},
+	ETODAY => {
+		HEXCODE  => "0d",
+		MULTIPLY => 0.01,
+		MEAS     => "kWh",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Accumulated Energy Today",
+	},
+	VPV    => {
+		HEXCODE  => "40",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Panel Voltage",
+	},
+	IAC    => {
+		HEXCODE  => "41",
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Grid Current",
+	},
+	VAC    => {
+		HEXCODE  => "42",
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Grid Voltage",
+	},
+	FAC    => {
+		HEXCODE  => "43",
+		MULTIPLY => 0.01,
+		MEAS     => "Hz",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Grid Frequency",
+	},
+	PAC    => {
+		HEXCODE  => "44",               # "0b" for 3phase
+		MULTIPLY => 1,
+		MEAS     => "W",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Output Power",
+	},
+	ZAC    => {
+		HEXCODE  => "45",
+		MULTIPLY => 1,
+		MEAS     => "mOhm",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Grid Impedance",
+	},
+	ETOTALH => {
+		HEXCODE  => "47",               # "07" for 3phase
+		MULTIPLY => 256,
+		MEAS     => "kWh",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Accumulated Energy (high bit)",
+	},
+	ETOTALL => {
+		HEXCODE  => "48",               # "08" for 3phase
+		MULTIPLY => 0.1,
+		MEAS     => "kWh",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Accumulated Energy (low bit)",
+	},
+	HTOTALH => {
+		HEXCODE  => "49",               # "09" for 3phase
+		MULTIPLY => 256,
+		MEAS     => "hrs",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Working Hours (high bit)",
+	},
+	HTOTALL => {
+		HEXCODE  => "4a",               # "0a" for 3phase
+		MULTIPLY => 1,
+		MEAS     => "hrs",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Working Hours (low bit)",
+	},
+	MODE   => {
+		HEXCODE  => "4c",               # "0c" for 3phase
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,		# 0=wait, 1=normal
+		DESCR    => "Operating Mode",
+	},
+	ERR_GV => {
+		HEXCODE  => "78",
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Error message: GV fault value",
+	},
+	ERR_GF => {
+		HEXCODE  => "79",
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+                DESCR    => "Error message: GF fault value",
+	},
+	ERR_GZ => {
+		HEXCODE  => "7a",
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+                DESCR    => "Error message: GZ fault value",
+	},
+	ERR_TEMP => {
+		HEXCODE  => "7b",
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+                DESCR    => "Error message: Tmp fault value",
+	},
+	ERR_PV1 => {
+		HEXCODE  => "7c",
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+                DESCR    => "Error message: PV1 fault value",
+	},
+	ERR_GFC1 => {
+		HEXCODE  => "7d",               # "3e" for 3phase
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+                DESCR    => "Error message: GFC1 fault value",
+	},
+	ERR_MODE => {
+		HEXCODE  => "7e",               # "3f" for 3phase
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+                DESCR    => "Error mode",
+	},
+	UNK10  => {
+		HEXCODE  => "7f",
+		MULTIPLY => 1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Unknown",
+	},
+      # ---------------- UNKNOWN ----------------------
+	UNK11  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Unknown",
+	},
+	UNK12  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Unknown",
+	},
+	UNK13  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Unknown",
+	},
+	UNK14  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "Unknown",
+	},
+	IDC1  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	IDC2  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	IDC3  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	IAC1  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	VAC1  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	FAC1  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.01,
+		MEAS     => "Hz",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	PDC1  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 1,
+		MEAS     => "W",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	IAC2  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	VAC2  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	FAC2  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.01,
+		MEAS     => "Hz",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	PDC2  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 1,
+		MEAS     => "W",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	IAC3  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "A",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	VAC3  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.1,
+		MEAS     => "V",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	FAC3  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 0.01,
+		MEAS     => "Hz",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+	PDC3  => {
+		HEXCODE  => "zz",		# unknown
+		MULTIPLY => 1,
+		MEAS     => "W",
+		INDEX    => -1,
+		VALUE    => 0,
+		DESCR    => "",
+	},
+# ---------------- UNKNOWN ----------------------
+# PVP1   "W",       "PV 1 voltage"
+# PVP2   "W",       "PV 2 voltage"
+# PVP3   "W",       "PV 3 voltage"
+# IAC1   "A",       "PV 1 Grid current"
+# IAC2   "A",       "PV 2 Grid current"
+# IAC3   "A",       "PV 3 Grid current"
+# VAC1   "V",       "PV 1 Grid voltage"
+# VAC2   "V",       "PV 2 Grid voltage"
+# VAC3   "V",       "PV 3 Grid voltage"
+# TEMP1  "deg C",   "External temperature sensor 1"
+# TEMP2  "deg C",   "External temperature sensor 2"
+# RAD1   "W/m2",    "Irradiance sensor 1"
+# RAD2   "W/m2",    "Irradiance sensor 2"
+);
+
+
+#
+# inverter version information (hash)
+#
+%HASH = (
+	CAPACITY => "",
+	FIRMWARE => "",
+	MODEL    => "",
+	MANUF    => "",
+	SERIAL   => "",
+	OTHER    => "",
+);
+
+#######################################################################
+
+
+
+#######################################################################
+#
+# Open serial/usb/bluetooth port depending on Operating System
+#
+sub initialiseSerialPort() {
+
+  print "Initialise Serial Port... ";
+  if ($^O eq 'MSWin32') {		# Win32 (ActivePerl)
+    eval "use Win32::SerialPort";
+    # If Win32::SerialPort error, check if installed:	perl -MWin32::SerialPort -e "print 'OK'"
+    # if not, try & fix dependencies:			ppm.bat install Win32::SerialPort
+    $port = SERIAL_PORT_WIN;
+
+    # Open the serial port
+    $serial = Win32::SerialPort->new ($port, 0, '') || die "Can\'t open $port: $!";
+  }
+  else {				# Unix/Linux/other
+    eval "use Device::SerialPort";
+    $port = SERIAL_PORT_OTH;
+
+    # Open the serial port
+    $serial = Device::SerialPort->new ($port, 0, '') || die "Can\'t open $port: $!";
+  }
+  print "port = $port\n";
+
+  #
+  # Open the serial port
+  #
+  $serial->error_msg(1); 		# use built-in hardware error messages like "Framing Error"
+  $serial->user_msg(1);			# use built-in function messages like "Waiting for ..."
+  $serial->baudrate(SERIAL_BAUD) || die 'fail setting baudrate, try -b option';
+  $serial->parity(SERIAL_PARITY) || die 'fail setting parity to none';
+  $serial->databits(SERIAL_DATABITS) || die 'fail setting databits to 8';
+  $serial->stopbits(SERIAL_STOPBITS) || die 'fail setting stopbits to 1';
+  $serial->handshake(SERIAL_HANDSHAKE) || die 'fail setting handshake to none';
+  $serial->datatype(SERIAL_DATATYPE) || die 'fail setting datatype raw';
+  $serial->write_settings || die 'could not write settings';
+  $serial->read_char_time(0);     	# don't wait for each character
+  $serial->read_const_time(1000); 	# 1 second per unfulfilled "read" call
+}
+
+#######################################################################
+#
+# Close serial/usb/bluetooth port
+#
+sub closeSerialPort() {
+    $serial->close;
+    undef $serial;
+}
+
+#######################################################################
+#
+# Trim function to remove whitespace from start and end of a string
+#
+sub trim($) {
+  my $string = shift;
+  $string =~ s/^\s+//;
+  $string =~ s/\s+$//;
+  return $string;
+}
+
+#######################################################################
+#
+# Turn raw data from the inverter into a hex string
+#
+sub convRawToHex() {
+  my $pstring = shift;
+  my $hstring = unpack ("H*",$pstring);
+  return $hstring;
+}
+
+#######################################################################
+#
+# Turn hex string into raw data for transmission to the inverter
+#
+sub convHexToRaw() {
+  my $hstring = shift;
+  my $pstring = pack (qq{H*},qq{$hstring});
+  return $pstring;
+}
+
+#######################################################################
+#
+# Write to the port (the inverter is on) & warn if it fails
+#
+sub writeToPort() {
+  my $writeStr = shift;
+  my $countOut = $serial->write($writeStr);
+  warn "*** write failed ( $countOut ) ***\n" unless ($countOut);
+  warn "*** write incomplete ( $countOut ) ***\n" if ( $countOut != length($writeStr) );
+  return $countOut;
+}
+
+#######################################################################
+#
+# Write to serial port then read result from buffer
+# until expected read response received or timeout exceeded
+#
+sub writeReadBuffer() {
+  my $writeString = shift;
+  my $readPattern = shift;
+  my $chars=0;
+  my $buffer="";
+  my $buffer2="x";
+  my $timeout = TIMEOUT_DEFAULT;
+  my $reinit = 0;
+
+  if (DEBUG_SCRIPT) {
+    print "writeReadBuffer: writeString=$writeString\n";
+    print "writeReadBuffer: readPattern=$readPattern\n";
+  }
+
+  #
+  # Write to (Serial) Port
+  #
+  &writeToPort(&convHexToRaw($writeString));
+
+  # sleep for dodgy cables (eg beginner soldering or usb converters)
+  # sleep 2;
+
+  #
+  # Read response from buffer until either expected response received or timeout reached
+  #
+  while ( $timeout > 0 ) {
+
+    my ($countIn,$stringIn) = $serial->read(255); 		# will read _up to_ 255 chars
+    if ($countIn > 0) {
+
+      if (DEBUG_SCRIPT) {
+        print "writeReadBuffer: saw..." . &convRawToHex($stringIn) . "\n";
+      }
+
+      $chars += $countIn;
+      $buffer .= $stringIn;
+      $hexBuffer = &convRawToHex($buffer);
+
+      #
+      # Check to see if expected read response is in the $buffer, say "last" if we find it
+      #
+      if ( $hexBuffer =~ /$readPattern/ ) {
+        ($buffer2) = ( $hexBuffer =~ /($readPattern.*$)/ );
+        if (DEBUG_SCRIPT) {
+          print "writeReadBuffer: found=$buffer2\n";
+        }
+        last;
+      }
+
+    }
+    else {
+      $timeout--;
+    }
+
+    #
+    # check if timeout was reached
+    #
+    if ($timeout==0) {
+      print "Re-Init...\n";
+      &closeSerialPort;
+      &initialiseSerialPort;
+
+      $timeout = TIMEOUT_DEFAULT;
+      $reinit++;
+
+      print "Waited " . TIMEOUT_DEFAULT . " seconds and never saw $readPattern\n";
+      #die "Waited " . TIMEOUT_DEFAULT . " seconds and never saw $readPattern\n";
+    }
+
+    if (REINIT_DEFAULT >= 0 & $reinit > REINIT_DEFAULT) {
+      &closeSerialPort;
+      die "REINIT MAX exceeded, aborted.\n";
+    }
+
+  }	# end of while loop
+
+  print "Recv <- $buffer2 \n";
+  return $buffer2;
+}
+
+#######################################################################
+#
+# Prepare the REQUEST_CONF_SERIAL packet
+# grab serial# from input data, use it to create the response packet, incl checksum in format:
+# RESPONSE_CONF_SERIAL_1 + $hexSerial + RESPONSE_CONF_SERIAL_2 + $hexReqChkSum
+#
+sub calcReqConfSerial() {
+  my $hexStr = shift;
+  my $hexSerial = substr($hexStr, 18, 20); 		# serial# is byte 9 through 18
+  my $hexReqRegex = REQUEST_CONF_SERIAL_1 . $hexSerial . REQUEST_CONF_SERIAL_2;
+
+  #
+  # calculate hex checksum for the request
+  #
+  my $rawReq = &convHexToRaw( $hexReqRegex );
+  my $rawReqChkSum = unpack ( "%C*", $rawReq );
+  my $hexReqChkSum = sprintf ( "%04x ", $rawReqChkSum );
+
+  #
+  # join it all together to create the request
+  #
+  my $reqConfSerial = $hexReqRegex . $hexReqChkSum;
+  return($reqConfSerial);
+}
+
+#######################################################################
+#
+# Initialise Inverter - handshake is done here
+#
+sub initialiseInverter() {
+  #
+  # step 1: Start initial handshake with inverter (reset network)
+  #
+  my $rawRequest = &convHexToRaw(REQUEST_INITIALISE);
+  print "Send -> req init inverter: " . REQUEST_INITIALISE . "\n";
+  &writeToPort($rawRequest);
+
+  #
+  # step 2: request the serial number (query network)
+  #
+  print "Send -> req serial: " . REQUEST_SERIAL . "\n";
+  my $hexResponse = &writeReadBuffer(REQUEST_SERIAL,RESPONSE_SERIAL);
+
+  #
+  # step 3: confirm the serial number
+  #
+  my $confSerialRequest = &calcReqConfSerial($hexResponse);
+  print "Send -> confirm serial: $confSerialRequest \n";
+  my $hexResponse2 = &writeReadBuffer($confSerialRequest,RESPONSE_CONF_SERIAL);
+}
+
+#######################################################################
+#
+# Parse Version/Firmware Data - store in %HASH
+#
+sub parseVersData() {
+  print "* Version info:\n";
+  my $hexData = shift;
+  my $asciiVers = ( pack ("H*", $hexData) );
+  my $hexLength = length($hexData);
+  print "asciiVers=$asciiVers\n";
+
+  #
+  # convert portions of hex to ascii
+  #
+  if ( CAPACITY_LENGTH > 0 && CAPACITY_INDEX + CAPACITY_LENGTH < $hexLength ) {
+    $HASH{CAPACITY} = &trim( pack ("H*", substr($hexData, CAPACITY_INDEX, CAPACITY_LENGTH)) );
+  }
+  if ( FIRMWARE_LENGTH > 0 && FIRMWARE_INDEX + FIRMWARE_LENGTH < $hexLength ) {
+    $HASH{FIRMWARE} = &trim( pack ("H*", substr($hexData, FIRMWARE_INDEX, FIRMWARE_LENGTH)) );
+  }
+  if ( MODEL_LENGTH > 0 && MODEL_INDEX + MODEL_LENGTH < $hexLength ) {
+    $HASH{MODEL} = &trim( pack ("H*", substr($hexData, MODEL_INDEX, MODEL_LENGTH)) );
+  }
+  if ( MANUF_LENGTH > 0 && MANUF_INDEX + MANUF_LENGTH < $hexLength ) {
+    $HASH{MANUF} = &trim( pack ("H*", substr($hexData, MANUF_INDEX, MANUF_LENGTH)) );
+  }
+  if ( SERIAL_LENGTH > 0 && SERIAL_INDEX + SERIAL_LENGTH < $hexLength ) {
+    $HASH{SERIAL} = &trim( pack ("H*", substr($hexData, SERIAL_INDEX, SERIAL_LENGTH)) );
+  }
+  if ( OTHER_LENGTH > 0 && OTHER_INDEX + OTHER_LENGTH < $hexLength ) {
+    $HASH{OTHER} = &trim( pack ("H*", substr($hexData, OTHER_INDEX, OTHER_LENGTH)) );
+  }
+
+  #
+  # display version information (in sorted order)
+  #
+  for $key ( sort( keys ( %HASH ) ) ) {
+     printf "%-8s : %s\n", $key, $HASH{$key};
+  }
+}
+
+#######################################################################
+#
+# Set Data Format Manually - if not sure of REQUEST_DATAFMT response break-up yet
+# eg: CMS 10000
+#
+sub setDataFmt2() {
+  print "* Data Format2:\n";
+  $HoH{TEMP}{INDEX} = 0;
+  $HoH{VPV}{INDEX} = 1;
+  $HoH{VPV2}{INDEX} = 2;
+  $HoH{VPV3}{INDEX} = 3;
+  $HoH{IDC1}{INDEX} = 4;
+  $HoH{IDC2}{INDEX} = 5;
+  $HoH{IDC3}{INDEX} = 6;
+  $HoH{ETOTALH}{INDEX} = 7;
+  $HoH{ETOTALL}{INDEX} = 8;
+  $HoH{HTOTALH}{INDEX} = 9;
+  $HoH{HTOTALL}{INDEX} = 10;
+  $HoH{PAC}{INDEX} = 11;
+  $HoH{MODE}{INDEX} = 12;
+  $HoH{ETODAY}{INDEX} = 13;
+  $HoH{ERR_GV}{INDEX} = 14;
+  $HoH{ERR_GF}{INDEX} = 15;
+  $HoH{ERR_GZ}{INDEX} = 16;
+  $HoH{ERR_TEMP}{INDEX} = 17;
+  $HoH{ERR_PV1}{INDEX} = 18;
+  $HoH{ERR_GFC1}{INDEX} = 19;
+  $HoH{ERR_MODE}{INDEX} = 20;
+  $HoH{IAC1}{INDEX} = 21;
+  $HoH{VAC1}{INDEX} = 22;
+  $HoH{FAC1}{INDEX} = 23;
+  $HoH{PDC1}{INDEX} = 24;
+  $HoH{UNK10}{INDEX} = 25;
+  $HoH{UNK11}{INDEX} = 26;
+  $HoH{UNK12}{INDEX} = 27;
+  $HoH{UNK13}{INDEX} = 28;
+  $HoH{IAC2}{INDEX} = 29;
+  $HoH{VAC2}{INDEX} = 30;
+  $HoH{FAC2}{INDEX} = 31;
+  $HoH{PDC2}{INDEX} = 32;
+  $HoH{UNK14}{INDEX} = 33;
+
+  #
+  # display data format indexes - sort %HoH by INDEX
+  #
+  for $key ( sort {$HoH{$a}{INDEX} <=> $HoH{$b}{INDEX} } keys ( %HoH ) ) {
+    if ( $HoH{$key}{INDEX} ne "-1" ) {
+      printf "%-8s = %2s = %s\n", $key, $HoH{$key}{INDEX}, $HoH{$key}{DESCR} ;
+    }
+  }
+}
+
+#######################################################################
+#
+# Parse Parameter Format
+# based on $HoHparams{HEXCODE} & store index/position in $HoHparams{INDEX}
+#
+sub parseParamFmt() {
+  print "* Parameter Format:\n";
+  my $hexData = shift;
+
+  # split hex string into an array of 2char hex strings
+  @d = ( $hexData =~ m/..?/g );
+
+  my $dataOffset = DATA_TO_FOLLOW_INDEX + 1;
+  my $dataToFollow = hex($d[DATA_TO_FOLLOW_INDEX]);
+  print "dataToFollow = hex($d[DATA_TO_FOLLOW_INDEX]) = $dataToFollow\n";
+
+  my $i = 0;
+  for $x ($dataOffset .. $dataOffset + $dataToFollow - 1) {
+    printf "%2s = %2s", $x, $d[$x] ;
+    for $key ( keys ( %HoHparams ) ) {
+      if ( $HoHparams{$key}{HEXCODE} eq $d[$x]) {
+        $HoHparams{$key}{INDEX} = $i;
+        printf " = %-10s = %2s = %s", $key, $HoHparams{$key}{INDEX}, $HoHparams{$key}{DESCR} ;
+      };
+    };
+    print "\n";
+    $i++;
+  };
+}
+
+#######################################################################
+#
+# Parse Parameters
+# based on $HoHparams{INDEX} & store value in $HoHparams{VALUE}
+#
+sub parseParam() {
+  print "* Parameters:\n";
+  my $hexData = shift;
+  my $dataToFollow = hex( substr( $hexData, DATA_TO_FOLLOW_INDEX*2, 2 ) );
+  my $startIndex = ( DATA_TO_FOLLOW_INDEX + 1 )*2;
+  my $numOfChars = $dataToFollow * 2;
+  my $data = substr( $hexData, $startIndex, $numOfChars );
+
+  # split hex string into an array of 4char hex strings
+  @d = ( $data =~ m/..?.?.?/g );
+
+  # display data values - sort %HoH by INDEX
+  for $key ( sort {$HoHparams{$a}{INDEX} <=> $HoHparams{$b}{INDEX} } keys ( %HoHparams ) ) {
+       if ( $HoHparams{$key}{INDEX} ne "-1" ) {
+         $HoHparams{$key}{VALUE} = hex( $d[$HoHparams{$key}{INDEX}] ) * $HoHparams{$key}{MULTIPLY};
+         printf "%-10s: %8s %-5s = %s \n", $key, $HoHparams{$key}{VALUE}, $HoHparams{$key}{MEAS}, $HoHparams{$key}{DESCR} ;
+       }
+  }
+}
+
+#######################################################################
+#
+# Parse Data Format
+# based on $HoH{HEXCODE} & store index/position in $HoH{INDEX}
+#
+sub parseDataFmt() {
+  print "* Data Format:\n";
+  my $hexData = shift;
+
+  # split hex string into an array of 2char hex strings
+  @d = ( $hexData =~ m/..?/g );
+
+  my $dataOffset = DATA_TO_FOLLOW_INDEX + 1;
+  my $dataToFollow = hex($d[DATA_TO_FOLLOW_INDEX]);
+  print "dataToFollow = hex($d[DATA_TO_FOLLOW_INDEX]) = $dataToFollow\n";
+
+  if ($HASH{MODEL} eq "CMS 10000") {
+    &setDataFmt2;	# temp: until get hold of CMS 10000 protocol & figure out hexcodes & keys
+    return;
+  }
+
+  my $i = 0;
+  for $x ($dataOffset .. $dataOffset + $dataToFollow - 1) {
+    printf "%2s = %2s", $x, $d[$x] ;
+    for $key ( keys ( %HoH ) ) {
+      if ( $HoH{$key}{HEXCODE} eq $d[$x]) {
+        $HoH{$key}{INDEX} = $i;
+        printf " = %-8s = %2s = %s", $key, $HoH{$key}{INDEX}, $HoH{$key}{DESCR} ;
+      };
+    };
+    print "\n";
+    $i++;
+  };
+}
+
+#######################################################################
+#
+# Parse Data
+# based on $HoH{INDEX} & store value in $HoH{VALUE}
+#
+sub parseData() {
+  print "* Data:\n";
+  my $hexData = shift;
+  my $dataToFollow = hex( substr( $hexData, DATA_TO_FOLLOW_INDEX*2, 2 ) );
+  my $startIndex = ( DATA_TO_FOLLOW_INDEX + 1 )*2;
+  my $numOfChars = $dataToFollow * 2;
+  my $data = substr( $hexData, $startIndex, $numOfChars );
+
+  # split hex string into an array of 4char hex strings
+  @d = ( $data =~ m/..?.?.?/g );
+
+  # display data values - sort %HoH by INDEX
+  for $key ( sort {$HoH{$a}{INDEX} <=> $HoH{$b}{INDEX} } keys ( %HoH ) ) {
+       if ( $HoH{$key}{INDEX} ne "-1" ) {
+         $HoH{$key}{VALUE} = hex( $d[$HoH{$key}{INDEX}] ) * $HoH{$key}{MULTIPLY};
+         printf "%-8s: %8s %-5s = %s \n", $key, $HoH{$key}{VALUE}, $HoH{$key}{MEAS}, $HoH{$key}{DESCR} ;
+       }
+  }
+
+  #
+  # Sometimes CMS2000 inverter keeps yesterdays ETODAY for first 30mins or more each morning
+  # hence some logic to use ZERO if hour < 9am and ETODAY > 1.0 kWh
+  #
+  if ($HASH{MODEL} eq "CMS 2000") {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    if ($hour < 9 && $HoH{ETODAY}{VALUE} > 1.0) {
+      $HoH{ETODAY}{VALUE} = 0;
+      print "NOTE: Using 0 for ETODAY instead, as appears it hasnt reset since yesterday yet.\n";
+    }
+  }
+}
+
+#######################################################################
+#
+# Return Date & Time in format: "DD/MM/YYYY HH:MM:SS"
+#
+sub getDateTime {
+  local($time_since_epoch) = @_;
+  local($sec,$min,$hour,$dayOfMth,$monthOffset,$yearOffset,$dayOfWk,$dayOfYr,$isDST) = localtime($time_since_epoch);
+  local($year) = 1900 + $yearOffset;
+  local($month) = 1 + $monthOffset;
+  return sprintf("%.2d/%.2d/%d %.2d:%.2d:%.2d", $dayOfMth, $month, $year, $hour, $min, $sec);
+}
+
+#######################################################################
+#
+# Return Date in format: "YYYYMMDD"
+#
+sub getDate_YYYYMMDD {
+  local($time_since_epoch) = @_;
+  local($sec,$min,$hour,$dayOfMth,$monthOffset,$yearOffset,$dayOfWk,$dayOfYr,$isDST) = localtime($time_since_epoch);
+  local($year) = 1900 + $yearOffset;
+  local($month) = 1 + $monthOffset;
+  return sprintf("%d%.2d%.2d", $year, $month, $dayOfMth);
+}
+
+#######################################################################
+#
+# Return Time in format: "HH:MM"
+#
+sub getTime_HHMM {
+  local($time_since_epoch) = @_;
+  local($sec,$min,$hour,$dayOfMth,$monthOffset,$yearOffset,$dayOfWk,$dayOfYr,$isDST) = localtime($time_since_epoch);
+  return sprintf("%.2d:%.2d", $hour, $min);
+}
+
+#######################################################################
+#
+# Return LogFile Name
+#
+sub getLogFileName {
+  my $logfile = "";
+
+  #
+  # set logfile prefix
+  #
+  if ($^O eq 'MSWin32') {		# Win32 (ActivePerl)
+     $logfile = LOGFILE_PREFIX_WIN;
+  }
+  else {				# Unix/Linux/other
+     $logfile = LOGFILE_PREFIX_OTH;
+  }
+
+  #
+  # append logfile suffix
+  #
+  $logfile .= $HASH{SERIAL} . "_" . getDate_YYYYMMDD(time) . ".csv";
+  return $logfile;
+}
+
+#######################################################################
+#
+# Return RRD File Name
+#
+sub getRrdFileName {
+  my $rrdfile = "";
+
+  #
+  # set logfile prefix
+  #
+  if ($^O eq 'MSWin32') {                # Win32 (ActivePerl)
+     $rrdfile = RRDFILE_PREFIX_WIN;
+  }
+  else {                                # Unix/Linux/other
+     $rrdfile = RRDFILE_PREFIX_OTH;
+  }
+
+  #
+  # append rrdfile suffix
+  #
+  $rrdfile .= $HASH{SERIAL} . ".rrd";
+  return $rrdfile;
+}
+
+#######################################################################
+#
+# Write certain inverter data to a csv file
+#
+sub writeToFile() {
+  my $logfile = getLogFileName();
+  my $rrdfile = getRrdFileName();
+
+  #
+  # open logfile in 'append' mode
+  #
+  if ( open(LOGFILE, ">>$logfile") ) {
+    print "Logging to: $logfile\n";
+
+    #
+    # add file header to logfile (if file exists & is empty)
+    #
+    if ( -z $logfile ) {
+#      print LOGFILE "DATE,TIMESTAMP,TEMP,VPV,IAC,VAC,FAC,PAC,ETOTAL,HTOTAL,MODE,ETODAY\n";
+      print LOGFILE "DATE,TIMESTAMP,TEMP,VPV,IAC,VAC,FAC,PAC,ETOTAL,HTOTAL,MODE,ETODAY" .
+                    ",ETOTALH,HTOTALH,ERR_GV,ERR_GF,ERR_GZ,ERR_TEMP,ERR_PV1,ERR_GFC1,ERR_MODE,UNK10\n";
+    }
+
+    my $etotal = ($HoH{ETOTALL}{VALUE} + $HoH{ETOTALH}{VALUE});
+    my $htotal = ($HoH{HTOTALL}{VALUE} + $HoH{HTOTALH}{VALUE});
+    if (DEBUG_SCRIPT) {
+      print "etotal=$etotal   htotal=$htotal\n";
+    }
+
+    #
+    # write data to logfile & close it
+    #
+    my $unixTimeStamp = time;                           # secs since epoch
+    my $dateTimeStr = getDateTime($unixTimeStamp);
+    my $csvLine = "$dateTimeStr,"         .
+                  "$unixTimeStamp,"       .
+                  "$HoH{TEMP}{VALUE},"    .
+                  "$HoH{VPV}{VALUE},"     .
+                  "$HoH{IAC}{VALUE},"     .
+                  "$HoH{VAC}{VALUE},"     .
+                  "$HoH{FAC}{VALUE},"     .
+                  "$HoH{PAC}{VALUE},"     .
+                  "$etotal,"              .
+                  "$htotal,"              .
+                  "$HoH{MODE}{VALUE},"    .
+                  "$HoH{ETODAY}{VALUE},"  .
+                  "$HoH{ETOTALH}{VALUE},"  .
+                  "$HoH{HTOTALH}{VALUE},"  .
+                  "$HoH{ERR_GV}{VALUE},"   .
+                  "$HoH{ERR_GF}{VALUE},"   .
+                  "$HoH{ERR_GZ}{VALUE},"   .
+                  "$HoH{ERR_TEMP}{VALUE}," .
+                  "$HoH{ERR_PV1}{VALUE},"  .
+                  "$HoH{ERR_GFC1}{VALUE}," .
+                  "$HoH{ERR_MODE}{VALUE}," .
+                  "$HoH{UNK10}{VALUE}";
+    print LOGFILE "$csvLine\n";
+    close (LOGFILE);
+
+    #
+    # write data to rrdtool for graphing
+    #
+    if (USE_RRDTOOL) {
+
+      my $rrdexe  = RRDTOOL_EXE_OTH;         # Unix/Linux/other
+      if ($^O eq 'MSWin32') {                # Win32 (ActivePerl)
+         $rrdexe  = RRDTOOL_EXE_WIN;
+      }
+
+      #
+      # create rrd file - if it doesn't exist
+      #
+      if ( ! -e $rrdfile ) {
+        print "Ran: " . CREATE_RRD_SCRIPT . " \"$rrdfile\" \"$rrdexe\"\n";
+        system (CREATE_RRD_SCRIPT . " \"$rrdfile\" \"$rrdexe\"" );
+      }
+
+      #
+      # update rrd file
+      #
+      my $rrdLine = "$unixTimeStamp:"       .
+                    "$HoH{TEMP}{VALUE}:"    .
+                    "$HoH{VPV}{VALUE}:"     .
+                    "$HoH{IAC}{VALUE}:"     .
+                    "$HoH{VAC}{VALUE}:"     .
+                    "$HoH{FAC}{VALUE}:"     .
+                    "$HoH{PAC}{VALUE}:"     .
+                    "$etotal:"              .
+                    "$htotal:"              .
+                    "$HoH{MODE}{VALUE}:"    .
+                    "$HoH{ETODAY}{VALUE}";
+      print "Ran: $rrdexe update $rrdfile $rrdLine\n";
+      system( "$rrdexe update $rrdfile $rrdLine" );
+    }
+
+  }
+  else {
+    warn "*** WARNING Could not open logfile: $logfile\n";
+  }
+}
+
+#######################################################################
+#
+# MAIN
+#
+print "Starting up at " . getDateTime(time) . " running on $^O ...\n";
+my $lastPollTime = 0;
+my $nextPollTime = 0;
+my $lastPvoutputTime = 0;
+my $nextPvoutputTime = 0;
+
+#
+# Initialise Serial Port & Inverter
+#
+&initialiseSerialPort;
+&initialiseInverter;
+
+#
+# Request Inverter Version Information
+#
+print "Send -> req version: " . REQUEST_VERSION . "\n";
+$hexResponse = &writeReadBuffer(REQUEST_VERSION,RESPONSE_VERSION);
+&parseVersData($hexResponse);
+
+#
+# Request Inverter Parameter Format Information
+#
+print "Send -> req param format: " . REQUEST_PARAMFMT . "\n";
+$hexResponse = &writeReadBuffer(REQUEST_PARAMFMT,RESPONSE_PARAMFMT);
+&parseParamFmt($hexResponse);
+
+#
+# Request Inverter Parameter Information
+#
+print "Send -> req params: " . REQUEST_PARAM . "\n";
+$hexResponse = &writeReadBuffer(REQUEST_PARAM,RESPONSE_PARAM);
+&parseParam($hexResponse);
+
+#
+# Request Inverter Data Format Information
+#
+print "Send -> req data format: " . REQUEST_DATAFMT . "\n";
+$hexResponse = &writeReadBuffer(REQUEST_DATAFMT,RESPONSE_DATAFMT);
+&parseDataFmt($hexResponse);
+
+#
+# The main loop starts here
+#
+while (1) {
+
+  #
+  # Request Inverter Data (regular data poll)
+  #
+  print "Send -> req data as at " . getDateTime(time) . " : " . REQUEST_DATA . "\n";
+  $lastPollTime = time;
+  $nextPollTime = $lastPollTime + DATAPOLL_FREQ_SECS;
+  $hexResponse = &writeReadBuffer(REQUEST_DATA,RESPONSE_DATA);
+  &parseData($hexResponse);
+  &writeToFile();
+
+  #
+  # Export data to http://pvoutput.org
+  #
+  if (USE_PVOUTPUT) {
+    $nextPvoutputTime = $lastPvoutputTime + PVOUTPUT_FREQ_SECS;
+    if ( $lastPvoutputTime == 0 || $nextPvoutputTime <= time ) {
+      my $date = getDate_YYYYMMDD(time);
+      my $time = getTime_HHMM(time);
+      print "PVOUTPUT as at " . getDateTime(time) . " ...\n";
+      print "  ran: " . PVOUTPUT_SCRIPT . " " . ($HoH{ETODAY}{VALUE} * 1000) . " $HoH{PAC}{VALUE} $date $time $HASH{SERIAL}\n";
+      system (PVOUTPUT_SCRIPT . " " . ($HoH{ETODAY}{VALUE} * 1000) . " $HoH{PAC}{VALUE} $date $time $HASH{SERIAL}" );
+      $lastPvoutputTime = time;
+    }
+  }
+
+  #
+  # Sleep until next time data needs to be polled (per DATAPOLL_FREQ_SECS constant)
+  #
+  $seconds = $nextPollTime - time;
+  print "Sleeping: $seconds secs as at " . getDateTime(time) . " ...\n";
+  if ( $seconds > 0 ) {
+    sleep $seconds;
+  }
+
+}
+
+#######################################################################
